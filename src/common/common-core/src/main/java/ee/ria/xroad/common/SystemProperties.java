@@ -307,6 +307,13 @@ public final class SystemProperties {
             PROXY_PREFIX + "server-support-clients-pooled-connections";
 
     /**
+     * Property name of the opt-in toggle that makes the server proxy synthesize a missing X-Road SOAP header
+     * for legacy SOAP service responses (WCF / JAX-WS / ASMX) before validation and signing.
+     */
+    public static final String SERVER_PROXY_AUTO_INJECT_MISSING_HEADERS =
+            PROXY_PREFIX + "server-auto-inject-missing-headers";
+
+    /**
      * Property name of the idle time that connections to the clientproxy connector are initially allowed,
      * in milliseconds
      */
@@ -1143,6 +1150,15 @@ public final class SystemProperties {
      */
     public static String getServerProxyListenAddress() {
         return System.getProperty(PROXY_SERVER_LISTEN_ADDRESS, DEFAULT_CONNECTOR_HOST);
+    }
+
+    /**
+     * @return whether the server proxy should synthesize a missing X-Road SOAP header for legacy SOAP service
+     * responses (WCF / JAX-WS / ASMX) before validation and signing, 'false' by default. When disabled, such
+     * responses are rejected with a missing header error (strict PR-MESS v4.0 §2.2 behaviour).
+     */
+    public static boolean getServerProxyAutoInjectMissingHeaders() {
+        return Boolean.parseBoolean(System.getProperty(SERVER_PROXY_AUTO_INJECT_MISSING_HEADERS, FALSE));
     }
 
     /**

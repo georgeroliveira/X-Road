@@ -303,6 +303,19 @@ public class SaxSoapParserImpl implements SoapParser {
         return new SoapHeaderHandler(header);
     }
 
+    /**
+     * Called during validation when the SOAP message does not contain a header. The default
+     * behaviour rejects the message as malformed. Subclasses may override this extension point
+     * (in the same spirit as {@link #isProcessedXmlRequired()}) to handle the missing header
+     * differently, for example by synthesizing one. Implementations must signal failure with a
+     * {@link CodedException}.
+     *
+     * @param handler the (unfinished) SOAP header handler of the message being parsed
+     */
+    protected void onMissingHeader(SoapHeaderHandler handler) {
+        throw new CodedException(X_MISSING_HEADER, MISSING_HEADER_MESSAGE);
+    }
+
     @RequiredArgsConstructor
     private final class XRoadSoapHandler extends DefaultHandler2 {
         private static final String NAMESPACE_PREFIX_SEPARATOR = ":";
@@ -383,7 +396,8 @@ public class SaxSoapParserImpl implements SoapParser {
 
         private void handleRootElement(Attributes attributes, QName element) {
             if (element.equals(QNAME_SOAP_ENVELOPE)) {
-                envelopeHandler = new SoapEnvelopeHandler(getSoapHeaderHandler(header));
+                envelopeHandler = new SoapEnvelopeHandler(getSoapHeaderHandler(header),
+                        SaxSoapParserImpl.this::onMissingHeader);
                 envelopeHandler.setAttributes(attributes);
                 envelopeHandler.openTag();
                 elementHandlers.push(envelopeHandler);
@@ -625,6 +639,7 @@ public class SaxSoapParserImpl implements SoapParser {
     @RequiredArgsConstructor
     private static final class SoapEnvelopeHandler extends XmlElementHandler {
         private final SoapHeaderHandler headerHandler;
+        private final Consumer<SoapHeaderHandler> missingHeaderHandler;
         private SoapBodyHandler bodyHandler;
 
         @Getter
@@ -664,7 +679,7 @@ public class SaxSoapParserImpl implements SoapParser {
 
         private void validateHeader() {
             if (!headerHandler.isFinished()) {
-                throw new CodedException(X_MISSING_HEADER, MISSING_HEADER_MESSAGE);
+                missingHeaderHandler.accept(headerHandler);
             }
             SoapHeader header = headerHandler.getHeader();
             if (header.getProtocolVersion() == null) {

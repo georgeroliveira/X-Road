@@ -32,6 +32,8 @@ import ee.ria.xroad.common.crypto.identifier.DigestAlgorithm;
 import ee.ria.xroad.common.identifier.ClientId;
 import ee.ria.xroad.common.identifier.SecurityServerId;
 import ee.ria.xroad.common.identifier.ServiceId;
+import ee.ria.xroad.common.message.RepresentedParty;
+import ee.ria.xroad.common.message.RequestHash;
 import ee.ria.xroad.common.message.SaxSoapParserImpl;
 import ee.ria.xroad.common.message.SoapFault;
 import ee.ria.xroad.common.message.SoapHeader;
@@ -660,8 +662,17 @@ class ServerMessageProcessor extends MessageProcessorBase {
 
     /**
      * Soap parser that adds the request message hash to the response message header.
+     *
+     * <p>When {@link SystemProperties#getServerProxyAutoInjectMissingHeaders()} is enabled and the service
+     * response is a legacy SOAP message without an X-Road header, this parser synthesizes the missing header
+     * (reconstructed from the request) before the SOAP body, so the response can be validated and signed like
+     * a regular X-Road response. When the toggle is disabled, the strict missing-header rejection is preserved.
      */
     private final class ResponseSoapParserImpl extends SaxSoapParserImpl {
+
+        private static final String SYNTHETIC_PREFIX_XROAD = "xrd";
+        private static final String SYNTHETIC_PREFIX_IDENTIFIERS = "id";
+        private static final String SYNTHETIC_PREFIX_REPRESENTATION = "repr";
 
         private boolean inHeader;
         private boolean inBody;
@@ -673,6 +684,12 @@ class ServerMessageProcessor extends MessageProcessorBase {
         private char[] bufferedChars;
         private int bufferedOffset;
         private int bufferedLength;
+
+        // set when a real SOAP header is encountered in the response
+        private boolean headerSeen;
+        // set when the synthetic header bytes have been written for this response
+        private boolean missingHeaderInjected;
+        private final Attributes emptyAttributes = new AttributesImpl();
 
         // force usage of processed XML since we need to write the request hash
         @Override
@@ -687,6 +704,7 @@ class ServerMessageProcessor extends MessageProcessorBase {
                 protected void openTag() {
                     super.openTag();
                     inHeader = true;
+                    headerSeen = true;
                 }
 
                 @Override
@@ -695,6 +713,19 @@ class ServerMessageProcessor extends MessageProcessorBase {
                     inHeader = false;
                 }
             };
+        }
+
+        @Override
+        protected void onMissingHeader(SoapHeaderHandler handler) {
+            if (!SystemProperties.getServerProxyAutoInjectMissingHeaders()) {
+                super.onMissingHeader(handler);
+                return;
+            }
+            // Auto-inject enabled: the synthetic header bytes are written at the SOAP body start
+            // (see writeStartElementXml); here we populate the in-memory header from the request so the
+            // required-field checks below pass and the response message carries valid metadata
+            // (client / service / queryId / protocolVersion) for logging and operational monitoring.
+            populateHeader(handler.getHeader());
         }
 
         @Override
@@ -707,22 +738,8 @@ class ServerMessageProcessor extends MessageProcessorBase {
             }
 
             if (inHeader && element.equals(QNAME_XROAD_QUERY_ID)) {
-                try {
-                    byte[] hashBytes = requestMessage.getSoap().getHash();
-                    String hash = encodeBase64(hashBytes);
-
-                    AttributesImpl hashAttrs = new AttributesImpl(attributes);
-                    DigestAlgorithm algoUri = SoapUtils.getHashAlgoId();
-                    hashAttrs.addAttribute("", "", ATTR_ALGORITHM_ID, "xs:string", algoUri.uri());
-
-                    char[] tabs = headerElementTabs != null ? headerElementTabs : new char[0];
-                    super.writeCharactersXml(tabs, 0, tabs.length, writer);
-                    super.writeStartElementXml(prefix, QNAME_XROAD_REQUEST_HASH, hashAttrs, writer);
-                    super.writeCharactersXml(hash.toCharArray(), 0, hash.length(), writer);
-                    super.writeEndElementXml(prefix, QNAME_XROAD_REQUEST_HASH, hashAttrs, writer);
-                } catch (Exception e) {
-                    throw translateException(e);
-                }
+                char[] tabs = headerElementTabs != null ? headerElementTabs : new char[0];
+                writeRequestHashElement(prefix, attributes, tabs, writer);
             }
         }
 
@@ -733,6 +750,7 @@ class ServerMessageProcessor extends MessageProcessorBase {
             } else {
                 if (!inBody && element.equals(QNAME_SOAP_BODY)) {
                     inBody = true;
+                    injectMissingHeaderIfNeeded(prefix, writer);
                 }
 
                 writeBufferedCharacters(writer);
@@ -779,6 +797,168 @@ class ServerMessageProcessor extends MessageProcessorBase {
             bufferedOffset = start;
             bufferedLength = length;
             bufferFlushed = false;
+        }
+
+        /**
+         * Writes the {@code xrd:requestHash} element (request message hash) using the request message digest.
+         * Shared by the in-stream injection (triggered by the response's own {@code xrd:id}) and by the
+         * synthetic header construction, guaranteeing the request hash is written exactly once.
+         */
+        private void writeRequestHashElement(String prefix, Attributes baseAttributes, char[] tabs, Writer writer) {
+            try {
+                byte[] hashBytes = requestMessage.getSoap().getHash();
+                String hash = encodeBase64(hashBytes);
+
+                AttributesImpl hashAttrs = new AttributesImpl(baseAttributes);
+                DigestAlgorithm algoUri = SoapUtils.getHashAlgoId();
+                hashAttrs.addAttribute("", "", ATTR_ALGORITHM_ID, "xs:string", algoUri.uri());
+
+                super.writeCharactersXml(tabs, 0, tabs.length, writer);
+                super.writeStartElementXml(prefix, QNAME_XROAD_REQUEST_HASH, hashAttrs, writer);
+                super.writeCharactersXml(hash.toCharArray(), 0, hash.length(), writer);
+                super.writeEndElementXml(prefix, QNAME_XROAD_REQUEST_HASH, hashAttrs, writer);
+            } catch (Exception e) {
+                throw translateException(e);
+            }
+        }
+
+        private void injectMissingHeaderIfNeeded(String soapPrefix, Writer writer) throws IOException {
+            if (headerSeen || missingHeaderInjected
+                    || !SystemProperties.getServerProxyAutoInjectMissingHeaders()) {
+                return;
+            }
+
+            writeSyntheticHeader(soapPrefix, writer);
+            missingHeaderInjected = true;
+        }
+
+        /**
+         * Writes the synthetic X-Road SOAP header bytes, reconstructed from the request message header,
+         * immediately before the SOAP body. The element order follows the X-Road message protocol
+         * (PR-MESS v4.0 §2.2): client, service, id, [userId], [issue], [representedParty], protocolVersion,
+         * requestHash. The values are copied verbatim from the request header; the request hash is appended
+         * the same way the in-stream injection does.
+         *
+         * <p>Namespace declarations are emitted on the synthetic header element itself because no prefix
+         * mappings arrived via SAX events (the envelope was already written to the stream). The SOAP prefix
+         * from the body event is reused for the {@code Header} element.
+         */
+        private void writeSyntheticHeader(String soapPrefix, Writer writer) throws IOException {
+            SoapHeader requestHeader = requestMessage.getSoap().getHeader();
+
+            AttributesImpl headerAttributes = new AttributesImpl();
+            addNamespaceDeclaration(headerAttributes, SYNTHETIC_PREFIX_XROAD, SoapHeader.NS_XROAD);
+            addNamespaceDeclaration(headerAttributes, SYNTHETIC_PREFIX_IDENTIFIERS, QNAME_ID_INSTANCE.getNamespaceURI());
+            if (requestHeader.getRepresentedParty() != null) {
+                addNamespaceDeclaration(headerAttributes, SYNTHETIC_PREFIX_REPRESENTATION, SoapHeader.NS_REPR);
+            }
+
+            super.writeStartElementXml(soapPrefix, QNAME_SOAP_HEADER, headerAttributes, writer);
+
+            writeClientElement(requestHeader.getClient(), writer);
+            writeServiceElement(requestHeader.getService(), writer);
+            writeXRoadTextElement(QNAME_XROAD_QUERY_ID, requestHeader.getQueryId(), writer);
+            if (requestHeader.getUserId() != null) {
+                writeXRoadTextElement(QNAME_XROAD_USER_ID, requestHeader.getUserId(), writer);
+            }
+            if (requestHeader.getIssue() != null) {
+                writeXRoadTextElement(QNAME_XROAD_ISSUE, requestHeader.getIssue(), writer);
+            }
+            if (requestHeader.getRepresentedParty() != null) {
+                writeRepresentedPartyElement(requestHeader.getRepresentedParty(), writer);
+            }
+            writeXRoadTextElement(QNAME_XROAD_PROTOCOL_VERSION, requestHeader.getProtocolVersion().getVersion(), writer);
+            writeRequestHashElement(SYNTHETIC_PREFIX_XROAD, emptyAttributes, new char[0], writer);
+
+            super.writeEndElementXml(soapPrefix, QNAME_SOAP_HEADER, emptyAttributes, writer);
+        }
+
+        private void writeClientElement(ClientId client, Writer writer) throws IOException {
+            super.writeStartElementXml(SYNTHETIC_PREFIX_XROAD, QNAME_XROAD_CLIENT,
+                    objectTypeAttribute(client.getObjectType().name()), writer);
+            writeIdentifierPart(QNAME_ID_INSTANCE, client.getXRoadInstance(), writer);
+            writeIdentifierPart(QNAME_ID_MEMBER_CLASS, client.getMemberClass(), writer);
+            writeIdentifierPart(QNAME_ID_MEMBER_CODE, client.getMemberCode(), writer);
+            if (client.getSubsystemCode() != null) {
+                writeIdentifierPart(QNAME_ID_SUBSYSTEM_CODE, client.getSubsystemCode(), writer);
+            }
+            super.writeEndElementXml(SYNTHETIC_PREFIX_XROAD, QNAME_XROAD_CLIENT, emptyAttributes, writer);
+        }
+
+        private void writeServiceElement(ServiceId service, Writer writer) throws IOException {
+            super.writeStartElementXml(SYNTHETIC_PREFIX_XROAD, QNAME_XROAD_SERVICE,
+                    objectTypeAttribute(service.getObjectType().name()), writer);
+            writeIdentifierPart(QNAME_ID_INSTANCE, service.getXRoadInstance(), writer);
+            writeIdentifierPart(QNAME_ID_MEMBER_CLASS, service.getMemberClass(), writer);
+            writeIdentifierPart(QNAME_ID_MEMBER_CODE, service.getMemberCode(), writer);
+            if (service.getSubsystemCode() != null) {
+                writeIdentifierPart(QNAME_ID_SUBSYSTEM_CODE, service.getSubsystemCode(), writer);
+            }
+            writeIdentifierPart(QNAME_ID_SERVICE_CODE, service.getServiceCode(), writer);
+            if (service.getServiceVersion() != null) {
+                writeIdentifierPart(QNAME_ID_SERVICE_VERSION, service.getServiceVersion(), writer);
+            }
+            super.writeEndElementXml(SYNTHETIC_PREFIX_XROAD, QNAME_XROAD_SERVICE, emptyAttributes, writer);
+        }
+
+        private void writeRepresentedPartyElement(RepresentedParty representedParty, Writer writer) throws IOException {
+            super.writeStartElementXml(SYNTHETIC_PREFIX_REPRESENTATION, QNAME_REPR_REPRESENTED_PARTY,
+                    emptyAttributes, writer);
+            if (representedParty.getPartyClass() != null) {
+                writeTextElement(SYNTHETIC_PREFIX_REPRESENTATION, QNAME_PARTY_CLASS,
+                        representedParty.getPartyClass(), writer);
+            }
+            writeTextElement(SYNTHETIC_PREFIX_REPRESENTATION, QNAME_PARTY_CODE, representedParty.getPartyCode(), writer);
+            super.writeEndElementXml(SYNTHETIC_PREFIX_REPRESENTATION, QNAME_REPR_REPRESENTED_PARTY,
+                    emptyAttributes, writer);
+        }
+
+        private AttributesImpl objectTypeAttribute(String objectType) {
+            AttributesImpl attributes = new AttributesImpl();
+            attributes.addAttribute(QNAME_ID_INSTANCE.getNamespaceURI(), ATTR_OBJECT_TYPE,
+                    SYNTHETIC_PREFIX_IDENTIFIERS + ":" + ATTR_OBJECT_TYPE, "CDATA", objectType);
+            return attributes;
+        }
+
+        private void addNamespaceDeclaration(AttributesImpl attributes, String prefix, String namespaceUri) {
+            attributes.addAttribute("", "", "xmlns:" + prefix, "CDATA", namespaceUri);
+        }
+
+        private void writeIdentifierPart(QName element, String value, Writer writer) throws IOException {
+            writeTextElement(SYNTHETIC_PREFIX_IDENTIFIERS, element, value, writer);
+        }
+
+        private void writeXRoadTextElement(QName element, String value, Writer writer) throws IOException {
+            writeTextElement(SYNTHETIC_PREFIX_XROAD, element, value, writer);
+        }
+
+        private void writeTextElement(String prefix, QName element, String value, Writer writer) throws IOException {
+            super.writeStartElementXml(prefix, element, emptyAttributes, writer);
+            super.writeCharactersXml(value.toCharArray(), 0, value.length(), writer);
+            super.writeEndElementXml(prefix, element, emptyAttributes, writer);
+        }
+
+        /**
+         * Populates the response's in-memory header from the request header so that the required-field
+         * validation passes and the response message carries valid metadata. Mirrors the fields written to
+         * the synthetic header bytes; the request hash is set as well for completeness (it does not affect
+         * the signed wire bytes, where the request hash is written exactly once by {@link #writeSyntheticHeader}).
+         */
+        private void populateHeader(SoapHeader target) {
+            SoapHeader requestHeader = requestMessage.getSoap().getHeader();
+            target.setClient(requestHeader.getClient());
+            target.setService(requestHeader.getService());
+            target.setQueryId(requestHeader.getQueryId());
+            target.setUserId(requestHeader.getUserId());
+            target.setIssue(requestHeader.getIssue());
+            target.setRepresentedParty(requestHeader.getRepresentedParty());
+            target.setProtocolVersion(requestHeader.getProtocolVersion());
+            target.setRequestHash(buildRequestHash());
+        }
+
+        private RequestHash buildRequestHash() {
+            return new RequestHash(SoapUtils.getHashAlgoId().uri(),
+                    encodeBase64(requestMessage.getSoap().getHash()));
         }
     }
 }
